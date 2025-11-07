@@ -1,0 +1,71 @@
+{{- /* 安全块子模板 */ -}}
+{{- define "secBlock" -}}
+# 安全增强: {{ .security.mode }}
+{{- $m := .security.mode -}}
+{{- if eq $m "template" }}
+    set $sec_tpl_used $tpl_{{ .security.template }};
+    if ($sec_should_deny) { return 403; }
+{{- else if or (eq $m "ip_whitelist") (eq $m "ip_blacklist") -}}
+    {{- $deny := eq $m "ip_blacklist" -}}
+    {{- range .security.filters }}
+    {{- if $deny }}    deny {{ . }};{{ else }}    allow {{ . }};{{ end }}
+    {{- end }}
+    {{- if eq $m "ip_whitelist" }}
+    deny all;
+    {{- end }}
+{{- else if or (eq $m "country_whitelist") (eq $m "country_blacklist") }}
+    {{- $op := cond (eq $m "country_blacklist") "~" "!~" -}}
+    {{- $regex := printf "^((%s))$" (join "|" .security.filters) -}}
+    if ($sec_country_code {{ $op }} '{{ $regex }}') { return 403; }
+{{- else }}
+# 无安全增强或未知模式
+{{- end -}}
+{{- end }}
+
+{{- /* upstream（负载均衡） */ -}}
+{{- if eq .mode "upstream" }}
+upstream {{ .upstream.name }} {
+{{- range .upstream.servers }}
+    server {{ .addr }}{{ if .weight }} weight={{ .weight }}{{ end }};
+{{- end }}
+}
+{{ end }}
+
+# {{ .name }} - OpenResty Stream Configuration
+server {
+    listen {{ .listen }} {{ .proto }};
+    {{- if .proxy_protocol }}
+    proxy_protocol on;
+    {{- end }}
+    proxy_timeout 10m;
+    proxy_connect_timeout 10s;
+
+{{- template "secBlock" . | nindent 4 }}
+    {{- if eq .mode "upstream" }}
+    proxy_pass {{ .upstream.name }};
+    {{- else }}
+    proxy_pass {{ .target }};
+    {{- end }}
+
+    # === Metrics: Prometheus counters & histogram
+    log_by_lua_block {
+        -- 这些全局对象在 http{} 的 init_worker_by_lua_block 中初始化：
+        --   prom_stream, m_conn, m_bytes, m_time
+        local svr = "{{ .name }}"
+        local status = tostring(ngx.var.status)
+        local sent = tonumber(ngx.var.bytes_sent) or 0
+        local recv = tonumber(ngx.var.bytes_received) or 0
+        local sec  = tonumber(ngx.var.session_time) or 0
+
+        if m_conn then
+            m_conn:inc(1, {svr, status})
+        end
+        if m_bytes then
+            m_bytes:inc(sent, {svr, "sent"})
+            m_bytes:inc(recv, {svr, "recv"})
+        end
+        if m_time then
+            m_time:observe(sec, {svr})
+        end
+    }
+}
